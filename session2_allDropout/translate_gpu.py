@@ -25,8 +25,8 @@ def print_matrix(matrix):
     return  
 
 def main(model, dictionary, dictionary_target, source_file, saveto, k=5,
-         normalize=False, n_process=5, chr_level=False, messageOff=False):
-    
+         normalize=False, n_process=5, chr_level=False,messageOff=False):
+
     if not messageOff:
         print 'load model model_options'
     if os.path.exists('%s.pkl' % model):
@@ -37,7 +37,7 @@ def main(model, dictionary, dictionary_target, source_file, saveto, k=5,
         with open('%s.pkl' % pklName, 'rb') as f:
             options = pkl.load(f)
             
-    if not messageOff:    
+    if not messageOff:   
         print 'load source dictionary and invert'
     with open(dictionary, 'rb') as f:
         word_dict = pkl.load(f)
@@ -46,7 +46,7 @@ def main(model, dictionary, dictionary_target, source_file, saveto, k=5,
         word_idict[vv] = kk
     word_idict[0] = '<eos>'
     word_idict[1] = 'UNK'
-
+    
     if not messageOff:
         print 'load target dictionary and invert'
     with open(dictionary_target, 'rb') as f:
@@ -125,30 +125,24 @@ def main(model, dictionary, dictionary_target, source_file, saveto, k=5,
                                    options, trng=trng, k=k, 
                                    maxlen=200,
                                    return_attention=True,
-                                   analyseBuffer = True,
                                    stochastic = False, 
                                    argmax = False,
                                    normalize = normalize)
         sample=sampleData[0]
         score=sampleData[1]
-        alpha_buffer_record=sampleData[2]
-        attention_record=sampleData[3]
+        attention_record=sampleData[2]
         
         # normalize scores according to sequence lengths
         if normalize:
             lengths = numpy.array([len(s) for s in sample])
             score = score / lengths
         sidx = numpy.argmin(score)
-        if messageOff or alpha_buffer_record is None:
-            buffer_weight=None
-        else:
-            buffer_weight=alpha_buffer_record[sidx]
             
-        if messageOff or attention_record is None:
+        if attention_record is None:
             attention=None
         else:
             attention=attention_record[sidx]
-        return sample[sidx], buffer_weight, attention
+        return sample[sidx], attention
 
     trans = []
     idx = 0
@@ -157,18 +151,16 @@ def main(model, dictionary, dictionary_target, source_file, saveto, k=5,
     for x , sSen in zip(sourceIndices , source):
         transData = _translate(x)
         y=transData[0]
+        attention=transData[1]
         if not messageOff:
-            buffer_weight=transData[1]
-            attention=transData[2]
             print 'Sen ',idx, ':',sSen # source sentence
         y = _seqs2sen(y)
         trans.append(y)
         if not messageOff:
             print 'translation:', y  # translation result
-            print 'buffer_weight:'
-            print_matrix(buffer_weight)
             print 'attention:'
-            print_matrix(attention)   
+    #         if attention is not None:
+            print_matrix(attention)
         idx += 1
 
     with open(saveto, 'w') as f:
@@ -180,7 +172,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('-k', type=int, default=5)
     parser.add_argument('-p', type=int, default=5)
-    parser.add_argument('-messageOff', action="store_true",default=False)
+    parser.add_argument('-messageOff',action="store_true", default=False)
     parser.add_argument('-n', action="store_true", default=False)
     parser.add_argument('-c', action="store_true", default=False)
     parser.add_argument('model', type=str)
@@ -192,5 +184,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     main(args.model, args.dictionary, args.dictionary_target, args.source,
-         args.saveto, k=args.k, n_process=args.p, messageOff=args.messageOff,
-         normalize=args.n, chr_level=args.c)
+         args.saveto, normalize=args.n, n_process=args.p,k=args.k,messageOff=args.messageOff,
+         chr_level=args.c)

@@ -16,7 +16,7 @@ import sys
 import time
 
 from collections import OrderedDict
-
+from bleu_validator import BleuValidator
 from data_iterator import TextIterator
 
 profile = False
@@ -40,7 +40,6 @@ def unzip(zipped):
 def itemlist(tparams):
     return [vv for kk, vv in tparams.iteritems()]
 
-
 # dropout
 def dropout_layer(state_before, use_noise, trng):
     proj = tensor.switch(
@@ -49,7 +48,15 @@ def dropout_layer(state_before, use_noise, trng):
                                      dtype=state_before.dtype),
         state_before * 0.5)
     return proj
-
+# dropout function used in all layers,keep all inputs as default
+def shared_dropout_layer(shape, use_noise, trng, retain_rate=1):
+    if retain_rate==1:# no drop out , return full ones mask
+        proj = tensor.ones(shape, dtype='float32')
+    else:
+        proj = tensor.switch(use_noise,
+                             trng.binomial(shape, p=retain_rate, n=1,dtype='float32'),
+                             theano.shared(numpy.float32(retain_rate)))
+    return proj
 
 # make prefix-appended name
 def _p(pp, name):
@@ -86,13 +93,11 @@ def get_layer(name):
     fns = layers[name]
     return (eval(fns[0]), eval(fns[1]))
 
-
 # some utilities
 def ortho_weight(ndim):
     W = numpy.random.randn(ndim, ndim)
     u, s, v = numpy.linalg.svd(W)
     return u.astype('float32')
-
 
 def norm_weight(nin, nout=None, scale=0.01, ortho=True):
     if nout is None:
@@ -103,14 +108,11 @@ def norm_weight(nin, nout=None, scale=0.01, ortho=True):
         W = scale * numpy.random.randn(nin, nout)
     return W.astype('float32')
 
-
 def tanh(x):
     return tensor.tanh(x)
 
-
 def linear(x):
     return x
-
 
 def concatenate(tensor_list, axis=0):
     """
@@ -155,7 +157,6 @@ def concatenate(tensor_list, axis=0):
         offset += tt.shape[axis]
 
     return out
-
 
 # batch preparation
 def prepare_data(seqs_x, seqs_y, maxlen=None, n_words_src=30000,
@@ -212,7 +213,6 @@ def param_init_fflayer(options, params, prefix='ff', nin=None, nout=None,
 
     return params
 
-
 def fflayer(tparams, state_below, options, prefix='rconv',
             activ='lambda x: tensor.tanh(x)', **kwargs):
     return eval(activ)(
@@ -249,8 +249,9 @@ def param_init_gru(options, params, prefix='gru', nin=None, dim=None):
 
     return params
 
-
 def gru_layer(tparams, state_below, options, prefix='gru', mask=None,
+              emb_dropout=None,
+              rec_dropout=None,
               **kwargs):
     nsteps = state_below.shape[0]
     if state_below.ndim == 3:
@@ -271,16 +272,16 @@ def gru_layer(tparams, state_below, options, prefix='gru', mask=None,
 
     # state_below is the input word embeddings
     # input to the gates, concatenated
-    state_below_ = tensor.dot(state_below, tparams[_p(prefix, 'W')]) + \
+    state_below_ = tensor.dot(state_below*emb_dropout[0], tparams[_p(prefix, 'W')]) + \
         tparams[_p(prefix, 'b')]
-    # input to compute the hidden state proposal
-    state_belowx = tensor.dot(state_below, tparams[_p(prefix, 'Wx')]) + \
+    # input to compute the hidden state proposal    
+    state_belowx = tensor.dot(state_below*emb_dropout[1], tparams[_p(prefix, 'Wx')]) + \
         tparams[_p(prefix, 'bx')]
 
     # step function to be used by scan
     # arguments    | sequences |outputs-info| non-seqs
-    def _step_slice(m_, x_, xx_, h_, U, Ux):
-        preact = tensor.dot(h_, U)
+    def _step_slice(m_, x_, xx_, h_, U, Ux, rec_dropout):
+        preact = tensor.dot(h_*rec_dropout[0], U)
         preact += x_
 
         # reset and update gates
@@ -288,7 +289,7 @@ def gru_layer(tparams, state_below, options, prefix='gru', mask=None,
         u = tensor.nnet.sigmoid(_slice(preact, 1, dim))
 
         # compute the hidden state proposal
-        preactx = tensor.dot(h_, Ux)
+        preactx = tensor.dot(h_*rec_dropout[1], Ux)
         preactx = preactx * r
         preactx = preactx + xx_
 
@@ -306,7 +307,9 @@ def gru_layer(tparams, state_below, options, prefix='gru', mask=None,
     init_states = [tensor.alloc(0., n_samples, dim)]
     _step = _step_slice
     shared_vars = [tparams[_p(prefix, 'U')],
-                   tparams[_p(prefix, 'Ux')]]
+                   tparams[_p(prefix, 'Ux')],
+                   rec_dropout,
+                   ]
 
     rval, updates = theano.scan(_step,
                                 sequences=seqs,
@@ -334,7 +337,15 @@ def param_init_gru_cond(options, params, prefix='gru_cond',
         nin_nonlin = nin
     if dim_nonlin is None:
         dim_nonlin = dim
-
+        
+    # attention: context -> hidden
+    Wc_att = norm_weight(dimctx)
+    params[_p(prefix, 'Wc_att')] = Wc_att
+    
+    b_att = numpy.zeros((dimctx,)).astype('float32')
+    params[_p(prefix, 'b_att')] = b_att
+    
+    #BI-RNN embedding projection for previous hidden state 
     W = numpy.concatenate([norm_weight(nin, dim),
                            norm_weight(nin, dim)], axis=1)
     params[_p(prefix, 'W')] = W
@@ -348,7 +359,8 @@ def param_init_gru_cond(options, params, prefix='gru_cond',
     Ux = ortho_weight(dim_nonlin)
     params[_p(prefix, 'Ux')] = Ux
     params[_p(prefix, 'bx')] = numpy.zeros((dim_nonlin,)).astype('float32')
-
+    
+    # updating present hidden state
     U_nl = numpy.concatenate([ortho_weight(dim_nonlin),
                               ortho_weight(dim_nonlin)], axis=1)
     params[_p(prefix, 'U_nl')] = U_nl
@@ -358,7 +370,6 @@ def param_init_gru_cond(options, params, prefix='gru_cond',
     params[_p(prefix, 'Ux_nl')] = Ux_nl
     params[_p(prefix, 'bx_nl')] = numpy.zeros((dim_nonlin,)).astype('float32')
 
-    # context to LSTM
     Wc = norm_weight(dimctx, dim*2)
     params[_p(prefix, 'Wc')] = Wc
 
@@ -366,22 +377,14 @@ def param_init_gru_cond(options, params, prefix='gru_cond',
     params[_p(prefix, 'Wcx')] = Wcx
 
     # attention: combined -> hidden
-    W_comb_att = norm_weight(dim, dimctx)
-    params[_p(prefix, 'W_comb_att')] = W_comb_att
-
-    # attention: context -> hidden
-    Wc_att = norm_weight(dimctx)
-    params[_p(prefix, 'Wc_att')] = Wc_att
-
-    # attention: hidden bias
-    b_att = numpy.zeros((dimctx,)).astype('float32')
-    params[_p(prefix, 'b_att')] = b_att
+    W_src_read = norm_weight(dim_nonlin, dimctx)
+    params[_p(prefix, 'W_src_read')] = W_src_read
 
     # attention:
-    U_att = norm_weight(dimctx, 1)
-    params[_p(prefix, 'U_att')] = U_att
-    c_att = numpy.zeros((1,)).astype('float32')
-    params[_p(prefix, 'c_tt')] = c_att
+    U_src_read = norm_weight(dimctx, 1)
+    params[_p(prefix, 'U_src_read')] = U_src_read
+    c_src_read = numpy.zeros((1,)).astype('float32')
+    params[_p(prefix, 'c_src_read')] = c_src_read
 
     return params
 
@@ -389,7 +392,8 @@ def param_init_gru_cond(options, params, prefix='gru_cond',
 def gru_cond_layer(tparams, state_below, options, prefix='gru',
                    mask=None, context=None, one_step=False,
                    init_memory=None, init_state=None,
-                   context_mask=None,
+                   context_mask=None,emb_dropout=None,
+                   ctx_dropout=None,rec_dropout=None,
                    **kwargs):
 
     assert context, 'Context must be provided'
@@ -416,7 +420,7 @@ def gru_cond_layer(tparams, state_below, options, prefix='gru',
     # projected context
     assert context.ndim == 3, \
         'Context must be 3-d: #annotation x #sample x dim'
-    pctx_ = tensor.dot(context, tparams[_p(prefix, 'Wc_att')]) +\
+    pctx_ = tensor.dot(context*ctx_dropout[0], tparams[_p(prefix, 'Wc_att')]) +\
         tparams[_p(prefix, 'b_att')]
 
     def _slice(_x, n, dim):
@@ -425,22 +429,24 @@ def gru_cond_layer(tparams, state_below, options, prefix='gru',
         return _x[:, n*dim:(n+1)*dim]
 
     # projected x
-    state_belowx = tensor.dot(state_below, tparams[_p(prefix, 'Wx')]) +\
+    state_belowx = tensor.dot(state_below*emb_dropout[0], tparams[_p(prefix, 'Wx')]) +\
         tparams[_p(prefix, 'bx')]
-    state_below_ = tensor.dot(state_below, tparams[_p(prefix, 'W')]) +\
+    state_below_ = tensor.dot(state_below*emb_dropout[1], tparams[_p(prefix, 'W')]) +\
         tparams[_p(prefix, 'b')]
 
     def _step_slice(m_, x_, xx_, h_, ctx_, alpha_, pctx_, cc_,
-                    U, Wc, W_comb_att, U_att, c_tt, Ux, Wcx,
-                    U_nl, Ux_nl, b_nl, bx_nl):
-        preact1 = tensor.dot(h_, U)
+                    rec_dropout,ctx_dropout,
+                    U, Wc, W_src_read, U_src_read, c_src_read, Ux, Wcx,
+                    U_nl, Ux_nl, b_nl, bx_nl,
+                    ):
+        preact1 = tensor.dot(h_*rec_dropout[0], U)
         preact1 += x_
         preact1 = tensor.nnet.sigmoid(preact1)
 
         r1 = _slice(preact1, 0, dim)
         u1 = _slice(preact1, 1, dim)
 
-        preactx1 = tensor.dot(h_, Ux)
+        preactx1 = tensor.dot(h_*rec_dropout[1], Ux)
         preactx1 *= r1
         preactx1 += xx_
 
@@ -450,11 +456,11 @@ def gru_cond_layer(tparams, state_below, options, prefix='gru',
         h1 = m_[:, None] * h1 + (1. - m_)[:, None] * h_
 
         # attention
-        pstate_ = tensor.dot(h1, W_comb_att)
+        pstate_ = tensor.dot(h1*rec_dropout[2], W_src_read)
         pctx__ = pctx_ + pstate_[None, :, :]
         #pctx__ += xc_
         pctx__ = tensor.tanh(pctx__)
-        alpha = tensor.dot(pctx__, U_att)+c_tt
+        alpha = tensor.dot(pctx__*ctx_dropout[1], U_src_read)+c_src_read
         alpha = alpha.reshape([alpha.shape[0], alpha.shape[1]])
         alpha = tensor.exp(alpha)
         if context_mask:
@@ -462,16 +468,16 @@ def gru_cond_layer(tparams, state_below, options, prefix='gru',
         alpha = alpha / alpha.sum(0, keepdims=True)
         ctx_ = (cc_ * alpha[:, :, None]).sum(0)  # current context
 
-        preact2 = tensor.dot(h1, U_nl)+b_nl
-        preact2 += tensor.dot(ctx_, Wc)
+        preact2 = tensor.dot(h1*rec_dropout[3], U_nl)+b_nl
+        preact2 += tensor.dot(ctx_*ctx_dropout[2], Wc)
         preact2 = tensor.nnet.sigmoid(preact2)
 
         r2 = _slice(preact2, 0, dim)
         u2 = _slice(preact2, 1, dim)
 
-        preactx2 = tensor.dot(h1, Ux_nl)+bx_nl
+        preactx2 = tensor.dot(h1*rec_dropout[4], Ux_nl)+bx_nl
         preactx2 *= r2
-        preactx2 += tensor.dot(ctx_, Wcx)
+        preactx2 += tensor.dot(ctx_*ctx_dropout[3], Wcx)
 
         h2 = tensor.tanh(preactx2)
 
@@ -486,18 +492,20 @@ def gru_cond_layer(tparams, state_below, options, prefix='gru',
 
     shared_vars = [tparams[_p(prefix, 'U')],
                    tparams[_p(prefix, 'Wc')],
-                   tparams[_p(prefix, 'W_comb_att')],
-                   tparams[_p(prefix, 'U_att')],
-                   tparams[_p(prefix, 'c_tt')],
+                   tparams[_p(prefix, 'W_src_read')],
+                   tparams[_p(prefix, 'U_src_read')],
+                   tparams[_p(prefix, 'c_src_read')],
                    tparams[_p(prefix, 'Ux')],
                    tparams[_p(prefix, 'Wcx')],
                    tparams[_p(prefix, 'U_nl')],
                    tparams[_p(prefix, 'Ux_nl')],
                    tparams[_p(prefix, 'b_nl')],
-                   tparams[_p(prefix, 'bx_nl')]]
+                   tparams[_p(prefix, 'bx_nl')],
+                   ]
 
     if one_step:
-        rval = _step(*(seqs + [init_state, None, None, pctx_, context] +
+        rval = _step(*(seqs + [init_state, None, None, pctx_, 
+                               context,rec_dropout,ctx_dropout] +
                        shared_vars))
     else:
         rval, updates = theano.scan(_step,
@@ -507,7 +515,7 @@ def gru_cond_layer(tparams, state_below, options, prefix='gru',
                                                                context.shape[2]),
                                                   tensor.alloc(0., n_samples,
                                                                context.shape[0])],
-                                    non_sequences=[pctx_, context]+shared_vars,
+                                    non_sequences=[pctx_, context,rec_dropout,ctx_dropout]+shared_vars,
                                     name=_p(prefix, '_layers'),
                                     n_steps=nsteps,
                                     profile=profile,
@@ -580,26 +588,67 @@ def build_model(tparams, options):
     n_timesteps = x.shape[0]
     n_timesteps_trg = y.shape[0]
     n_samples = x.shape[1]
-
+    
+    if options['use_dropout']:
+        retain_emb=1-options['dropout_emb']
+        retain_src=1-options['dropout_src']
+        retain_trg=1-options['dropout_trg']
+        retain_hidden=1-options['dropout_hidden']
+        
+        # sentence to embedding
+        src_dropout = shared_dropout_layer((n_timesteps,n_samples,1), use_noise, trng, retain_src)
+        trg_dropout = shared_dropout_layer((n_timesteps_trg,n_samples,1), use_noise, trng, retain_trg)
+        src_dropout = tensor.tile(src_dropout,(1,1,options['dim_word']))
+        trg_dropout = tensor.tile(trg_dropout,(1,1,options['dim_word']))
+        #in GRU,2 mask is needed(gate and state).BiRNN encoder is GRU
+        rec_dropout = shared_dropout_layer((2,n_samples,options['dim']), use_noise, trng, retain_hidden)
+        emb_dropout = shared_dropout_layer((2,n_samples,options['dim_word']), use_noise, trng, retain_emb)
+        rec_dropout_r = shared_dropout_layer((2,n_samples,options['dim']), use_noise, trng, retain_hidden)
+        emb_dropout_r = shared_dropout_layer((2,n_samples,options['dim_word']), use_noise, trng, retain_emb)
+        #in decoder(cond_GRU),there are 2 GRU layers,and ctx is used in hidden state update and result 
+        rec_dropout_d = shared_dropout_layer((5,n_samples,options['dim']), use_noise, trng, retain_hidden)
+        emb_dropout_d = shared_dropout_layer((2,n_samples,options['dim_word']), use_noise, trng, retain_emb)
+        ctx_dropout_d = shared_dropout_layer((4,n_samples,2*options['dim']), use_noise, trng, retain_hidden)
+    else:
+        rec_dropout = theano.shared(numpy.array([1.]*2,dtype='float32'))
+        emb_dropout = theano.shared(numpy.array([1.]*2,dtype='float32'))
+        rec_dropout_r = theano.shared(numpy.array([1.]*2,dtype='float32'))
+        emb_dropout_r = theano.shared(numpy.array([1.]*2,dtype='float32'))
+        rec_dropout_d = theano.shared(numpy.array([1.]*5,dtype='float32'))
+        emb_dropout_d = theano.shared(numpy.array([1.]*2,dtype='float32'))
+        ctx_dropout_d = theano.shared(numpy.array([1.]*4,dtype='float32'))
+        
     # word embedding for forward rnn (source)
     emb = tparams['Wemb'][x.flatten()]
     emb = emb.reshape([n_timesteps, n_samples, options['dim_word']])
+    if options['use_dropout']:
+        emb=emb*src_dropout
     proj = get_layer(options['encoder'])[1](tparams, emb, options,
                                             prefix='encoder',
-                                            mask=x_mask)
+                                            mask=x_mask,
+                                            emb_dropout=emb_dropout,
+                                            rec_dropout=rec_dropout,
+                                            )
+
     # word embedding for backward rnn (source)
     embr = tparams['Wemb'][xr.flatten()]
     embr = embr.reshape([n_timesteps, n_samples, options['dim_word']])
+    if options['use_dropout']:
+        embr = embr*src_dropout[::-1]
     projr = get_layer(options['encoder'])[1](tparams, embr, options,
                                              prefix='encoder_r',
-                                             mask=xr_mask)
+                                             mask=xr_mask,
+                                             emb_dropout=emb_dropout_r,
+                                             rec_dropout=rec_dropout_r,
+                                             )
 
     # context will be the concatenation of forward and backward rnns
     ctx = concatenate([proj[0], projr[0][::-1]], axis=proj[0].ndim-1)
 
     # mean of the context (across time) will be used to initialize decoder rnn
     ctx_mean = (ctx * x_mask[:, :, None]).sum(0) / x_mask.sum(0)[:, None]
-
+    if options['use_dropout']:
+        ctx_mean *= shared_dropout_layer((n_samples,2*options['dim']), use_noise, trng, retain_hidden)
     # or you can use the last state of forward + backward encoder rnns
     # ctx_mean = concatenate([proj[0][-1], projr[0][-1]], axis=proj[0].ndim-2)
 
@@ -616,6 +665,8 @@ def build_model(tparams, options):
     emb_shifted = tensor.zeros_like(emb)
     emb_shifted = tensor.set_subtensor(emb_shifted[1:], emb[:-1])
     emb = emb_shifted
+    if options['use_dropout']:
+        emb *= trg_dropout
 
     # decoder - pass through the decoder conditional gru with attention
     proj = get_layer(options['decoder'])[1](tparams, emb, options,
@@ -623,14 +674,18 @@ def build_model(tparams, options):
                                             mask=y_mask, context=ctx,
                                             context_mask=x_mask,
                                             one_step=False,
-                                            init_state=init_state)
+                                            init_state=init_state,
+                                            emb_dropout=emb_dropout_d,
+                                            ctx_dropout=ctx_dropout_d,
+                                            rec_dropout=rec_dropout_d,
+                                            )
     # hidden states of the decoder gru
     proj_h = proj[0]
 
     # weighted averages of context, generated by attention module
     ctxs = proj[1]
 
-    # weights (alignment matrix)
+    # weights (alignment matrix, for supervised alignment)
     opt_ret['dec_alphas'] = proj[2]
 
     # compute word probabilities
@@ -642,7 +697,8 @@ def build_model(tparams, options):
                                    prefix='ff_logit_ctx', activ='linear')
     logit = tensor.tanh(logit_lstm+logit_prev+logit_ctx)
     if options['use_dropout']:
-        logit = dropout_layer(logit, use_noise, trng)
+        logit *= shared_dropout_layer((n_samples,options['dim_word']), use_noise, trng, retain_hidden)
+        
     logit = get_layer('ff')[1](tparams, logit, options,
                                prefix='ff_logit', activ='linear')
     logit_shp = logit.shape
@@ -658,7 +714,96 @@ def build_model(tparams, options):
 
     return trng, use_noise, x, x_mask, y, y_mask, opt_ret, cost
 
+# build force sampler
+def build_force_sampler(tparams,options,use_noise):
+    # build force-sample given inputs and outputs 
+    # which is quite similar to that of build_model
+    x = tensor.matrix('x', dtype='int64')
+    y = tensor.matrix('y', dtype='int64')
+    xr = x[::-1]
 
+    n_timesteps = x.shape[0]
+    n_timesteps_trg = y.shape[0]
+    n_samples = x.shape[1]
+    
+    emb = tparams['Wemb'][x.flatten()]
+    emb = emb.reshape([n_timesteps, n_samples, options['dim_word']])
+    embr = tparams['Wemb'][xr.flatten()]
+    embr = embr.reshape([n_timesteps, n_samples, options['dim_word']])
+    if options['use_dropout']:
+        retain_emb=1-options['dropout_emb']
+        retain_src=1-options['dropout_src']
+        retain_trg=1-options['dropout_trg']
+        retain_hidden=1-options['dropout_hidden']
+        # sentence to embedding
+        src_dropout = theano.shared(numpy.float32(retain_src))
+        trg_dropout = theano.shared(numpy.float32(retain_trg))
+        emb *= src_dropout
+        embr *= trg_dropout
+        #in GRU,2 mask is needed(gate and state).BiRNN encoder is GRU
+        rec_dropout = theano.shared(numpy.array([retain_hidden]*2,dtype='float32'))
+        emb_dropout = theano.shared(numpy.array([retain_emb]*2,dtype='float32'))
+        rec_dropout_r = theano.shared(numpy.array([retain_hidden]*2,dtype='float32'))
+        emb_dropout_r = theano.shared(numpy.array([retain_emb]*2,dtype='float32'))
+        #in decoder(cond_GRU),there are 2 GRU layers,and ctx is used in hidden state update and result 
+        rec_dropout_d = theano.shared(numpy.array([retain_hidden]*5,dtype='float32'))
+        emb_dropout_d = theano.shared(numpy.array([retain_emb]*2,dtype='float32'))
+        ctx_dropout_d = theano.shared(numpy.array([retain_hidden]*4,dtype='float32'))
+    else:
+        rec_dropout = theano.shared(numpy.array([1.]*2,dtype='float32'))
+        emb_dropout = theano.shared(numpy.array([1.]*2,dtype='float32'))
+        rec_dropout_r = theano.shared(numpy.array([1.]*2,dtype='float32'))
+        emb_dropout_r = theano.shared(numpy.array([1.]*2,dtype='float32'))
+        rec_dropout_d = theano.shared(numpy.array([1.]*5,dtype='float32'))
+        emb_dropout_d = theano.shared(numpy.array([1.]*2,dtype='float32'))
+        ctx_dropout_d = theano.shared(numpy.array([1.]*4,dtype='float32'))
+    # encoder
+    proj = get_layer(options['encoder'])[1](tparams, emb, options,
+                                            prefix='encoder',
+                                            emb_dropout=emb_dropout,
+                                            rec_dropout=rec_dropout,)
+    projr = get_layer(options['encoder'])[1](tparams, embr, options,
+                                             prefix='encoder_r',
+                                             emb_dropout=emb_dropout_r,
+                                             rec_dropout=rec_dropout_r,)
+
+    # concatenate forward and backward rnn hidden states
+    ctx = concatenate([proj[0], projr[0][::-1]], axis=proj[0].ndim-1)
+
+    # get the input for decoder rnn initializer mlp
+    ctx_mean = ctx.mean(0)
+    if options['use_dropout']:
+        ctx_mean*=retain_hidden
+    # ctx_mean = concatenate([proj[0][-1],projr[0][-1]], axis=proj[0].ndim-2)
+    init_state = get_layer('ff')[1](tparams, ctx_mean, options,
+                                    prefix='ff_state', activ='tanh')
+
+    emb = tparams['Wemb_dec'][y.flatten()]
+    emb = emb.reshape([n_timesteps_trg, n_samples, options['dim_word']])
+    emb_shifted = tensor.zeros_like(emb)
+    emb_shifted = tensor.set_subtensor(emb_shifted[1:], emb[:-1])
+    emb = emb_shifted
+    if options['use_dropout']:
+        emb*=trg_dropout
+    
+    # decoder - pass through the decoder conditional gru with attention
+    proj = get_layer(options['decoder'])[1](tparams, emb, options,
+                                            prefix='decoder',
+                                            mask=None, context=ctx,
+                                            one_step=False,
+                                            init_state=init_state,
+                                            emb_dropout=emb_dropout_d,
+                                            ctx_dropout=ctx_dropout_d,
+                                            rec_dropout=rec_dropout_d,
+                                            )
+    attention = proj[2]
+    print 'Building force_decode_record...',
+    inps = [x, y]
+    outs = [attention]
+    force_decode_record=theano.function(inps, outs, name='force_decode_record', profile=profile)
+    print 'Done'
+    return force_decode_record
+    
 # build a sampler
 def build_sampler(tparams, options, trng, use_noise):
     x = tensor.matrix('x', dtype='int64')
@@ -669,20 +814,55 @@ def build_sampler(tparams, options, trng, use_noise):
     # word embedding (source), forward and backward
     emb = tparams['Wemb'][x.flatten()]
     emb = emb.reshape([n_timesteps, n_samples, options['dim_word']])
+
     embr = tparams['Wemb'][xr.flatten()]
     embr = embr.reshape([n_timesteps, n_samples, options['dim_word']])
+    
+    if options['use_dropout']:
+        retain_emb=1-options['dropout_emb']
+        retain_src=1-options['dropout_src']
+        retain_trg=1-options['dropout_trg']
+        retain_hidden=1-options['dropout_hidden']
+        # sentence to embedding
+        src_dropout = theano.shared(numpy.float32(retain_src))
+        trg_dropout = theano.shared(numpy.float32(retain_trg))
+        emb *= src_dropout
+        embr *= trg_dropout
+        #in GRU,2 mask is needed(gate and state).BiRNN encoder is GRU
+        rec_dropout = theano.shared(numpy.array([retain_hidden]*2,dtype='float32'))
+        emb_dropout = theano.shared(numpy.array([retain_emb]*2,dtype='float32'))
+        rec_dropout_r = theano.shared(numpy.array([retain_hidden]*2,dtype='float32'))
+        emb_dropout_r = theano.shared(numpy.array([retain_emb]*2,dtype='float32'))
+        #in decoder(cond_GRU),there are 2 GRU layers,and ctx is used in hidden state update and result 
+        rec_dropout_d = theano.shared(numpy.array([retain_hidden]*5,dtype='float32'))
+        emb_dropout_d = theano.shared(numpy.array([retain_emb]*2,dtype='float32'))
+        ctx_dropout_d = theano.shared(numpy.array([retain_hidden]*4,dtype='float32'))
+    else:
+        rec_dropout = theano.shared(numpy.array([1.]*2,dtype='float32'))
+        emb_dropout = theano.shared(numpy.array([1.]*2,dtype='float32'))
+        rec_dropout_r = theano.shared(numpy.array([1.]*2,dtype='float32'))
+        emb_dropout_r = theano.shared(numpy.array([1.]*2,dtype='float32'))
+        rec_dropout_d = theano.shared(numpy.array([1.]*5,dtype='float32'))
+        emb_dropout_d = theano.shared(numpy.array([1.]*2,dtype='float32'))
+        ctx_dropout_d = theano.shared(numpy.array([1.]*4,dtype='float32'))
 
     # encoder
     proj = get_layer(options['encoder'])[1](tparams, emb, options,
-                                            prefix='encoder')
+                                            prefix='encoder',
+                                            emb_dropout=emb_dropout,
+                                            rec_dropout=rec_dropout,)
     projr = get_layer(options['encoder'])[1](tparams, embr, options,
-                                             prefix='encoder_r')
+                                             prefix='encoder_r',
+                                             emb_dropout=emb_dropout_r,
+                                             rec_dropout=rec_dropout_r,)
 
     # concatenate forward and backward rnn hidden states
     ctx = concatenate([proj[0], projr[0][::-1]], axis=proj[0].ndim-1)
 
     # get the input for decoder rnn initializer mlp
     ctx_mean = ctx.mean(0)
+    if options['use_dropout']:
+        ctx_mean*=retain_hidden
     # ctx_mean = concatenate([proj[0][-1],projr[0][-1]], axis=proj[0].ndim-2)
     init_state = get_layer('ff')[1](tparams, ctx_mean, options,
                                     prefix='ff_state', activ='tanh')
@@ -700,28 +880,42 @@ def build_sampler(tparams, options, trng, use_noise):
     emb = tensor.switch(y[:, None] < 0,
                         tensor.alloc(0., 1, tparams['Wemb_dec'].shape[1]),
                         tparams['Wemb_dec'][y])
+    if options['use_dropout']:
+        emb*=trg_dropout
 
     # apply one step of conditional gru with attention
     proj = get_layer(options['decoder'])[1](tparams, emb, options,
                                             prefix='decoder',
                                             mask=None, context=ctx,
                                             one_step=True,
-                                            init_state=init_state)
+                                            init_state=init_state,
+                                            emb_dropout=emb_dropout_d,
+                                            ctx_dropout=ctx_dropout_d,
+                                            rec_dropout=rec_dropout_d,)
     # get the next hidden state
     next_state = proj[0]
-
     # get the weighted averages of context for this target word y
     ctxs = proj[1]
+    # get attention weight 
+    attention= proj[2]
 
-    logit_lstm = get_layer('ff')[1](tparams, next_state, options,
-                                    prefix='ff_logit_lstm', activ='linear')
+    if options['use_dropout']:
+        next_state_new=next_state * retain_hidden
+        emb*=retain_emb
+        ctxs*=retain_hidden
+    else:
+        next_state_new=next_state
+
+    logit_lstm = get_layer('ff')[1](tparams, next_state_new, options,
+                                   prefix='ff_logit_lstm', activ='linear')
     logit_prev = get_layer('ff')[1](tparams, emb, options,
                                     prefix='ff_logit_prev', activ='linear')
     logit_ctx = get_layer('ff')[1](tparams, ctxs, options,
                                    prefix='ff_logit_ctx', activ='linear')
     logit = tensor.tanh(logit_lstm+logit_prev+logit_ctx)
     if options['use_dropout']:
-        logit = dropout_layer(logit, use_noise, trng)
+        logit *=retain_hidden
+    
     logit = get_layer('ff')[1](tparams, logit, options,
                                prefix='ff_logit', activ='linear')
 
@@ -735,7 +929,7 @@ def build_sampler(tparams, options, trng, use_noise):
     # sampled word for the next target, next hidden state to be used
     print 'Building f_next..',
     inps = [y, ctx, init_state]
-    outs = [next_probs, next_sample, next_state]
+    outs = [next_probs, next_sample, next_state, attention]
     f_next = theano.function(inps, outs, name='f_next', profile=profile)
     print 'Done'
 
@@ -745,7 +939,8 @@ def build_sampler(tparams, options, trng, use_noise):
 # generate sample, either with stochastic sampling or beam search. Note that,
 # this function iteratively calls f_init and f_next functions.
 def gen_sample(tparams, f_init, f_next, x, options, trng=None, k=1, maxlen=30,
-               stochastic=True, argmax=False):
+               stochastic=True, argmax=False, return_attention=False, 
+               normalize=True):
 
     # k is the beam size we have
     if k > 1:
@@ -754,6 +949,9 @@ def gen_sample(tparams, f_init, f_next, x, options, trng=None, k=1, maxlen=30,
 
     sample = []
     sample_score = []
+    ########## attention record by Vergil ###########
+    attention_record=[]
+      
     if stochastic:
         sample_score = 0
 
@@ -761,6 +959,10 @@ def gen_sample(tparams, f_init, f_next, x, options, trng=None, k=1, maxlen=30,
     dead_k = 0
 
     hyp_samples = [[]] * live_k
+    ########## attention record by Vergil ###########
+    if return_attention:
+        hyp_attention_record=[[]]*live_k
+        
     hyp_scores = numpy.zeros(live_k).astype('float32')
     hyp_states = []
 
@@ -773,7 +975,8 @@ def gen_sample(tparams, f_init, f_next, x, options, trng=None, k=1, maxlen=30,
         ctx = numpy.tile(ctx0, [live_k, 1])
         inps = [next_w, ctx, next_state]
         ret = f_next(*inps)
-        next_p, next_w, next_state = ret[0], ret[1], ret[2]
+        next_p, next_w, next_state, attention =\
+         ret[0], ret[1], ret[2], ret[3]
 
         if stochastic:
             if argmax:
@@ -795,17 +998,24 @@ def gen_sample(tparams, f_init, f_next, x, options, trng=None, k=1, maxlen=30,
             costs = cand_flat[ranks_flat]
 
             new_hyp_samples = []
+            if return_attention:    
+                new_attention_record = []
+                
             new_hyp_scores = numpy.zeros(k-dead_k).astype('float32')
             new_hyp_states = []
 
             for idx, [ti, wi] in enumerate(zip(trans_indices, word_indices)):
                 new_hyp_samples.append(hyp_samples[ti]+[wi])
+                if return_attention:    
+                    new_attention_record.append(hyp_attention_record[ti]+[attention[ti]])
+
                 new_hyp_scores[idx] = copy.copy(costs[idx])
                 new_hyp_states.append(copy.copy(next_state[ti]))
 
             # check the finished samples
             new_live_k = 0
             hyp_samples = []
+            hyp_attention_record = []
             hyp_scores = []
             hyp_states = []
 
@@ -813,10 +1023,15 @@ def gen_sample(tparams, f_init, f_next, x, options, trng=None, k=1, maxlen=30,
                 if new_hyp_samples[idx][-1] == 0:
                     sample.append(new_hyp_samples[idx])
                     sample_score.append(new_hyp_scores[idx])
+                    if return_attention:    
+                        attention_record.append(new_attention_record[idx])
                     dead_k += 1
                 else:
                     new_live_k += 1
                     hyp_samples.append(new_hyp_samples[idx])
+                    if return_attention:    
+                        hyp_attention_record.append(new_attention_record[idx])
+                    
                     hyp_scores.append(new_hyp_scores[idx])
                     hyp_states.append(new_hyp_states[idx])
             hyp_scores = numpy.array(hyp_scores)
@@ -836,8 +1051,13 @@ def gen_sample(tparams, f_init, f_next, x, options, trng=None, k=1, maxlen=30,
             for idx in xrange(live_k):
                 sample.append(hyp_samples[idx])
                 sample_score.append(hyp_scores[idx])
+            if return_attention:
+                    attention_record.append(hyp_attention_record[idx])
+    
+    if not return_attention:
+        attention_record=None    
 
-    return sample, sample_score
+    return sample, sample_score, attention_record
 
 
 # calculate the log probablities on a given corpus using translation model
@@ -868,31 +1088,38 @@ def pred_probs(f_log_probs, prepare_data, options, iterator, verbose=True):
 
 # optimizers
 # name(hyperp, tparams, grads, inputs (list), cost) = f_grad_shared, f_update
-def adam(lr, tparams, grads, inp, cost, beta1=0.9, beta2=0.999, e=1e-8):
-
-    gshared = [theano.shared(p.get_value() * 0., name='%s_grad' % k)
+def adam(lr, tparams, grads, inp, cost):
+    gshared = [theano.shared(p.get_value() * 0.,
+                             name='%s_grad' % k)
                for k, p in tparams.iteritems()]
     gsup = [(gs, g) for gs, g in zip(gshared, grads)]
 
     f_grad_shared = theano.function(inp, cost, updates=gsup, profile=profile)
 
+    lr0 = 0.0002
+    b1 = 0.1
+    b2 = 0.001
+    e = 1e-8
+
     updates = []
 
-    t_prev = theano.shared(numpy.float32(0.))
-    t = t_prev + 1.
-    lr_t = lr * tensor.sqrt(1. - beta2**t) / (1. - beta1**t)
+    i = theano.shared(numpy.float32(0.))
+    i_t = i + 1.
+    fix1 = 1. - b1**(i_t)
+    fix2 = 1. - b2**(i_t)
+    lr_t = lr0 * (tensor.sqrt(fix2) / fix1)
 
     for p, g in zip(tparams.values(), gshared):
-        m = theano.shared(p.get_value() * 0., p.name + '_mean')
-        v = theano.shared(p.get_value() * 0., p.name + '_variance')
-        m_t = beta1 * m + (1. - beta1) * g
-        v_t = beta2 * v + (1. - beta2) * g**2
-        step = lr_t * m_t / (tensor.sqrt(v_t) + e)
-        p_t = p - step
+        m = theano.shared(p.get_value() * 0.)
+        v = theano.shared(p.get_value() * 0.)
+        m_t = (b1 * g) + ((1. - b1) * m)
+        v_t = (b2 * tensor.sqr(g)) + ((1. - b2) * v)
+        g_t = m_t / (tensor.sqrt(v_t) + e)
+        p_t = p - (lr_t * g_t)
         updates.append((m, m_t))
         updates.append((v, v_t))
         updates.append((p, p_t))
-    updates.append((t_prev, t))
+    updates.append((i, i_t))
 
     f_update = theano.function([lr], [], updates=updates,
                                on_unused_input='ignore', profile=profile)
@@ -984,6 +1211,7 @@ def train(dim_word=100,  # word vector dimensionality
           encoder='gru',
           decoder='gru_cond',
           patience=10,  # early stopping patience
+          patience_bleu=50, # early stopping patience
           max_epochs=5000,
           finish_after=10000000,  # finish after this many updates
           dispFreq=100,
@@ -1009,13 +1237,22 @@ def train(dim_word=100,  # word vector dimensionality
           dictionaries=[
               '/data/lisatmp3/chokyun/europarl/europarl-v7.fr-en.en.tok.pkl',
               '/data/lisatmp3/chokyun/europarl/europarl-v7.fr-en.fr.tok.pkl'],
-          use_dropout=False,
+          use_dropout=False,# whether dropout on all layers
+          dropout_emb=0.1, # dropout rate on layers(used in layer init)
+          dropout_hidden=0.2, 
+          dropout_src=0.0,
+          dropout_trg=0.0,
           reload_=False,
-          overwrite=False):
+          overwrite=False,
+          **bleu_params
+          ):
 
     # Model options
     model_options = locals().copy()
 
+    # BLEU validation #
+    bleu_valid = BleuValidator(model_options, **bleu_params)
+    
     # load dictionaries and invert them
     worddicts = [None] * len(dictionaries)
     worddicts_r = [None] * len(dictionaries)
@@ -1118,13 +1355,19 @@ def train(dim_word=100,  # word vector dimensionality
 
     best_p = None
     bad_counter = 0
+    bad_counter_bleu = 0
     uidx = 0
     estop = False
     history_errs = []
+    history_bleu = []
+    valid_not_fin = []
     # reload history
     if reload_ and os.path.exists(saveto):
         rmodel = numpy.load(saveto)
-        history_errs = list(rmodel['history_errs'])
+        if 'history_errs' in rmodel:
+            history_errs = list(rmodel['history_errs'])
+        if 'history_bleu' in rmodel:
+            history_bleu = list(rmodel['history_bleu'])
         if 'uidx' in rmodel:
             uidx = rmodel['uidx']
 
@@ -1171,40 +1414,55 @@ def train(dim_word=100,  # word vector dimensionality
             # verbose
             if numpy.mod(uidx, dispFreq) == 0:
                 print 'Epoch ', eidx, 'Update ', uidx, 'Cost ', cost, 'UD ', ud
-
             # save the best model so far, in addition, save the latest model
             # into a separate file with the iteration number for external eval
+#########################################################################################
             if numpy.mod(uidx, saveFreq) == 0:
+                # overwrite the model
                 print 'Saving the best model...',
                 if best_p is not None:
                     params = best_p
                 else:
                     params = unzip(tparams)
-                numpy.savez(saveto, history_errs=history_errs, uidx=uidx, **params)
+                numpy.savez(saveto, 
+                            history_errs=history_errs, 
+                            history_bleu=history_bleu,
+                            uidx=uidx, **params)
                 pkl.dump(model_options, open('%s.pkl' % saveto, 'wb'))
                 print 'Done'
-
+                
+#                 if numpy.mod(uidx, saveFreq*50) == 0:
+#                     print 'Saving (Check Point) at iteration {}...'.format(uidx),
+#                     saveto_uidx = '{}.iter{}.npz'.format(
+#                         os.path.splitext(saveto)[0], uidx)
+#                     numpy.savez(saveto_uidx, history_errs=history_errs,
+#                                 uidx=uidx, **unzip(tparams))
+#                     print 'Done'
+                    
                 # save with uidx
                 if not overwrite:
                     print 'Saving the model at iteration {}...'.format(uidx),
                     saveto_uidx = '{}.iter{}.npz'.format(
                         os.path.splitext(saveto)[0], uidx)
-                    numpy.savez(saveto_uidx, history_errs=history_errs,
+                    numpy.savez(saveto_uidx, 
+                                history_errs=history_errs,
+                                history_bleu=history_bleu,
                                 uidx=uidx, **unzip(tparams))
                     print 'Done'
-
-
+###################################################################################
             # generate some samples with the model and display them
             if numpy.mod(uidx, sampleFreq) == 0:
                 # FIXME: random selection?
                 for jj in xrange(numpy.minimum(5, x.shape[1])):
                     stochastic = True
-                    sample, score = gen_sample(tparams, f_init, f_next,
+                    sampleData = gen_sample(tparams, f_init, f_next,
                                                x[:, jj][:, None],
                                                model_options, trng=trng, k=1,
                                                maxlen=30,
                                                stochastic=stochastic,
                                                argmax=False)
+                    sample = sampleData[0]
+                    score = sampleData[1]
                     print 'Source ', jj, ': ',
                     for vv in x[:, jj]:
                         if vv == 0:
@@ -1237,31 +1495,77 @@ def train(dim_word=100,  # word vector dimensionality
                         else:
                             print 'UNK',
                     print
-
+###################################################################################
             # validate model on validation set and early stop if necessary
             if numpy.mod(uidx, validFreq) == 0:
                 use_noise.set_value(0.)
                 valid_errs = pred_probs(f_log_probs, prepare_data,
                                         model_options, valid)
                 valid_err = valid_errs.mean()
-                history_errs.append(valid_err)
-
-                if uidx == 0 or valid_err <= numpy.array(history_errs).min():
-                    best_p = unzip(tparams)
-                    bad_counter = 0
-                if len(history_errs) > patience and valid_err >= \
-                        numpy.array(history_errs)[:-patience].min():
-                    bad_counter += 1
-                    if bad_counter > patience:
-                        print 'Early Stop!'
-                        estop = True
-                        break
-
+                history_errs.append(valid_err)   
+            # bleu validation only happends when valid cost came below 100
+            # or the bleu is always 0 then early stops when training starts
+                if valid_err<70 and numpy.mod(uidx,validFreq*10)==0:
+                    # save a independent model for bleu validation:
+                    temp_p = unzip(tparams)
+                    print 'Saving (Check Point) at iteration {}...'.format(uidx),
+                    saveto_uidx = '{}.iter{}.npz'.format(
+                        os.path.splitext(saveto)[0], uidx)
+                    numpy.savez(saveto_uidx, 
+                                history_errs=history_errs,
+                                history_bleu=history_bleu,
+                                uidx=uidx, **unzip(tparams))
+                    print 'Done'
+                    # validate the saved model and get bleu , subprocess 
+                    # is stored and checked before a new validation
+                    if len(valid_not_fin) > 0:
+                        previous_open,previous_p,previous_model,previous_trans,previous_uidx,previous_eidx = \
+                            valid_not_fin.pop()
+                        previous_open.wait()
+                        valid_bleu = bleu_valid.testBLEU(previous_trans)
+                        history_bleu.append(valid_bleu)
+                        print 'Epoch %d Update %d BLEU %f\t Best BLEU %f' %\
+                            (previous_eidx, previous_uidx, valid_bleu, numpy.array(history_bleu).max())  
+                        if previous_uidx == 0 or valid_bleu>=numpy.array(history_bleu).max():
+                            best_p = previous_p
+                            bad_counter_bleu = 0
+                        if len(history_bleu) > patience_bleu and valid_bleu <=\
+                                numpy.array(history_bleu)[:-patience_bleu].max():
+                            bad_counter_bleu += 1
+                            if bad_counter_bleu > patience_bleu:
+                                print 'Early Stop'
+                                estop = True
+                                break
+                        # remove the temporal model used in validation
+                        if numpy.mod(previous_uidx,validFreq*100)!=0:
+                            print 'remove temp file...%s'%(previous_model),
+#                             print previous_uidx,bad_counter_bleu,
+                            bleu_valid.remove_temp_file(model_file=previous_model,trans_file=previous_trans)                        
+                            print ' Done'
+                        
+                    trans_saveto="transAtt.iter%d" % uidx
+                    popen = bleu_valid.decode(theano.config.device,
+                                              trans_saveto,
+                                              saveto_uidx,
+                                              )
+                    valid_not_fin.append((popen,temp_p,saveto_uidx,trans_saveto,copy.deepcopy(uidx),eidx))
+                else:
+                # using default validation with valid_errs
+                    if uidx == 0 or valid_err <= numpy.array(history_errs).min():
+                        best_p = unzip(tparams)
+                        bad_counter = 0
+                    if len(history_errs) > patience and valid_err >= \
+                            numpy.array(history_errs)[:-patience].min():
+                        bad_counter += 1
+                        if bad_counter > patience:
+                            print 'Early Stop!'
+                            estop = True
+                            break   
+                        
                 if numpy.isnan(valid_err):
                     ipdb.set_trace()
-
-                print 'Valid ', valid_err
-
+                print 'Valid ', valid_err   
+#################################################################################                            
             # finish after this many updates
             if uidx >= finish_after:
                 print 'Finishing after %d iterations!' % uidx
@@ -1272,6 +1576,18 @@ def train(dim_word=100,  # word vector dimensionality
 
         if estop:
             break
+        
+    if len(valid_not_fin)>0:
+        popen,previous_p,previous_model,previous_trans,previous_uidx,previous_eidx = \
+                            valid_not_fin.pop()
+        popen.wait()
+        valid_bleu = bleu_valid.testBLEU(previous_trans)
+        history_bleu.append(valid_bleu)
+        if valid_bleu > numpy.array(history_bleu).max():
+            best_p=previous_p
+            os.system('cp %s %s' % (previous_model,saveto))
+        print 'Final Update %d BLEU %f\t Best BLEU %f' \
+              % (uidx, this_bleu, numpy.array(history_bleu).max())
 
     if best_p is not None:
         zipp(best_p, tparams)
@@ -1285,6 +1601,7 @@ def train(dim_word=100,  # word vector dimensionality
     params = copy.copy(best_p)
     numpy.savez(saveto, zipped_params=best_p,
                 history_errs=history_errs,
+                history_bleu=history_bleu,
                 uidx=uidx,
                 **params)
 

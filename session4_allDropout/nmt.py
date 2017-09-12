@@ -17,7 +17,7 @@ import time
 # import pydot
 
 from collections import OrderedDict
-
+from bleu_validator import BleuValidator
 from data_iterator import TextIterator
 
 profile = False
@@ -252,7 +252,7 @@ def param_init_buffer(options, params, prefix='init_buffer',size=None,dim=None,n
 def buffer_init_layer(tparams,state_below,options,
                       timestep=None,mask=None,
                       prefix='init_buffer',
-                      activ = 'lambda x : tensor.nnet.sigmoid(x)',**kwargs):  
+                      activ = 'lambda x : tensor.nnet.tanh(x)',**kwargs):  
       
     assert state_below.ndim == 2 ,'context_sum for initiation must be 2D'
 #     print 'initiating buffer'
@@ -580,8 +580,6 @@ def memDec_layer(tparams, state_below, options, prefix='memDec',
         alpha_buf = tensor.dot(pbuf__*buf_dropout[1], U_buf_read)+c_buf_read
         alpha_buf = alpha_buf.reshape([alpha_buf.shape[0],alpha_buf.shape[1]])
         
-#         alpha_buf = tensor.exp(alpha_buf)
-#         alpha_buf = alpha_buf/alpha_buf.sum(0,keepdims=True)# soft-max
         alpha_buf = tensor.nnet.sigmoid(alpha_buf)
 
         # reading weight interpolation(need transpose)
@@ -604,10 +602,12 @@ def memDec_layer(tparams, state_below, options, prefix='memDec',
         pctx__ = tensor.tanh(pctx__)
         alpha = tensor.dot(pctx__*ctx_dropout[1], U_src_read)+c_src_read
         alpha = alpha.reshape([alpha.shape[0], alpha.shape[1]])
-        alpha = tensor.exp(alpha)
         if context_mask:
             alpha = alpha * context_mask
-        alpha = alpha / alpha.sum(0, keepdims=True)
+#         alpha = alpha/alpha.sum(0, keepdims=True)
+        alpha = alpha-alpha.max(axis=0, keepdims=True)
+        alpha = alpha- tensor.log(tensor.exp(alpha).sum(axis=0,keepdims=True))
+        alpha = tensor.exp(alpha)
         ctx_ = (cc_ * alpha[:, :, None]).sum(0)  # current context
         
         # GRU combining context(ctx_, state) embedding is included in state 
@@ -846,7 +846,7 @@ def build_model(tparams, options):
 #     print 'init state dim ',init_state.ndim # dimension=2
     init_memory = get_layer('buffer_init')[1](tparams,ctx_sum,options,
                                     mask=x_mask,
-                                    prefix='init_buffer',activ='sigmoid')
+                                    prefix='init_buffer',activ='tanh')
 
     # init_read = tensor.alloc(0., n_samples,options['buffer_size'])
     # word embedding (target), we will shift the target sequence one time step
@@ -908,6 +908,115 @@ def build_model(tparams, options):
     cost = (cost * y_mask).sum(0)
 
     return trng, use_noise, x, x_mask, y, y_mask, opt_ret, cost
+# build force sampler
+def build_force_sampler(tparams,options,use_noise):
+    # build force-sample given inputs and outputs 
+    # which is quite similar to that of build_model
+    x = tensor.matrix('x', dtype='int64')
+    y = tensor.matrix('y', dtype='int64')
+    xr = x[::-1]
+
+    n_timesteps = x.shape[0]
+    n_timesteps_trg = y.shape[0]
+    n_samples = x.shape[1]
+    
+    emb = tparams['Wemb'][x.flatten()]
+    emb = emb.reshape([n_timesteps, n_samples, options['dim_word']])
+    embr = tparams['Wemb'][xr.flatten()]
+    embr = embr.reshape([n_timesteps, n_samples, options['dim_word']])
+    if options['use_dropout']:
+        # during test time create mean network as compensation 4 drop-out 
+        retain_emb=1-options['dropout_emb']
+        retain_src=1-options['dropout_src']
+        retain_trg=1-options['dropout_trg']
+        retain_hidden=1-options['dropout_hidden']
+        # sentence to embedding
+        src_dropout = theano.shared(numpy.float32(retain_src))
+        trg_dropout = theano.shared(numpy.float32(retain_trg))
+        emb *= src_dropout
+        embr *= trg_dropout
+        #in GRU,2 mask is needed(gate and state).BiRNN encoder is GRU
+        rec_dropout = theano.shared(numpy.array([retain_hidden]*2,dtype='float32'))
+        emb_dropout = theano.shared(numpy.array([retain_emb]*2,dtype='float32'))
+        rec_dropout_r = theano.shared(numpy.array([retain_hidden]*2,dtype='float32'))
+        emb_dropout_r = theano.shared(numpy.array([retain_emb]*2,dtype='float32'))
+        #in decoder(cond_GRU),there are 2 GRU layers,and ctx is used in hidden state update and result 
+        rec_dropout_d = theano.shared(numpy.array([retain_hidden]*10,dtype='float32'))
+        emb_dropout_d = theano.shared(numpy.array([retain_emb]*2,dtype='float32'))
+        ctx_dropout_d = theano.shared(numpy.array([retain_hidden]*4,dtype='float32'))
+        buf_dropout_d = theano.shared(numpy.array([retain_hidden]*3,dtype='float32'))
+    else:
+        rec_dropout = theano.shared(numpy.array([1.]*2,dtype='float32'))
+        emb_dropout = theano.shared(numpy.array([1.]*2,dtype='float32'))
+        rec_dropout_r = theano.shared(numpy.array([1.]*2,dtype='float32'))
+        emb_dropout_r = theano.shared(numpy.array([1.]*2,dtype='float32'))
+        rec_dropout_d = theano.shared(numpy.array([1.]*10,dtype='float32'))
+        emb_dropout_d = theano.shared(numpy.array([1.]*2,dtype='float32'))
+        ctx_dropout_d = theano.shared(numpy.array([1.]*4,dtype='float32'))
+        buf_dropout_d = theano.shared(numpy.array([1.]*3,dtype='float32'))
+        
+    # encoder
+    proj = get_layer(options['encoder'])[1](tparams, emb, options,
+                                            prefix='encoder',
+                                            emb_dropout=emb_dropout,
+                                            rec_dropout=rec_dropout,)
+    projr = get_layer(options['encoder'])[1](tparams, embr, options,
+                                             prefix='encoder_r',
+                                             emb_dropout=emb_dropout_r,
+                                             rec_dropout=rec_dropout_r,)
+    # concatenate forward and backward rnn hidden states
+    sourceMem = concatenate([proj[0], projr[0][::-1]], axis=proj[0].ndim-1)
+
+    # get the input for decoder rnn initializer mlp
+    ctx_sum = sourceMem.sum(0)
+    if options['use_dropout']:
+        ctx_sum*= retain_hidden
+    ctx_mean = sourceMem.mean(0)
+    
+    # ctx_mean = concatenate([proj[0][-1],projr[0][-1]], axis=proj[0].ndim-2)
+    init_state = get_layer('ff')[1](tparams, ctx_mean, options,
+                                    prefix='ff_state', activ='tanh')
+
+    init_memory = get_layer('buffer_init')[1](tparams,ctx_sum,options,
+                                            timestep = sourceMem.shape[0],
+                                            prefix='init_buffer',
+                                            activ='tanh'
+                                            )
+    emb = tparams['Wemb_dec'][y.flatten()]
+    emb = emb.reshape([n_timesteps_trg, n_samples, options['dim_word']])
+    emb_shifted = tensor.zeros_like(emb)
+    emb_shifted = tensor.set_subtensor(emb_shifted[1:], emb[:-1])
+    emb = emb_shifted
+    if options['use_dropout']:
+        emb *= trg_dropout
+
+    # decoder - pass through the decoder conditional gru with attention
+    proj = get_layer(options['decoder'])[1](tparams, emb, options,
+                                            prefix='decoder',
+                                            mask=None, context=sourceMem,
+                                            one_step = False,
+                                            init_memory = init_memory,
+                                            init_state = init_state,
+                                            emb_dropout=emb_dropout_d,
+                                            ctx_dropout=ctx_dropout_d,
+                                            rec_dropout=rec_dropout_d,
+                                            buf_dropout=buf_dropout_d,
+                                            )
+    # (all time steps)hidden states of the decoder GRU: dimension=3
+    proj_h = proj[0]
+    # weighted averages of context, generated by attention module
+    ctxs = proj[1]
+    # weights (alignment matrix for cost) and weights(buffer alignment) 
+    attention = proj[2]
+    buffer_weight = proj[4] 
+    
+    print 'Building force_decode_record...',
+    inps = [x, y]
+    outs = [buffer_weight,attention]
+    force_decode_record=theano.function(inps, outs, name='force_decode_record', profile=profile)
+    print 'Done'
+    
+    return force_decode_record
 
 # build a sampler
 def build_sampler(tparams, options, trng, use_noise):
@@ -923,6 +1032,7 @@ def build_sampler(tparams, options, trng, use_noise):
     embr = embr.reshape([n_timesteps, n_samples, options['dim_word']])
 
     if options['use_dropout']:
+        # during test time create mean network as compensation 4 drop-out 
         retain_emb=1-options['dropout_emb']
         retain_src=1-options['dropout_src']
         retain_trg=1-options['dropout_trg']
@@ -978,7 +1088,7 @@ def build_sampler(tparams, options, trng, use_noise):
     init_memory = get_layer('buffer_init')[1](tparams,ctx_sum,options,
                                             timestep = sourceMem.shape[0],
                                             prefix='init_buffer',
-                                            activ='sigmoid'
+                                            activ='tanh'
                                             )
     # initiate elements for decoder: sample needs init_state init_memory and context(no need for init_read)
     print 'Building f_init...',
@@ -1371,6 +1481,7 @@ def train(dim_word=100,  # word vector dimensionality
           encoder='gru',
           decoder='memDec',
           patience=10,  # early stopping patience
+          patience_bleu=50, # early stopping patience for bleu
           max_epochs=5000,
           finish_after=10000000,  # finish after this many updates
           dispFreq=100, # update info display frequency
@@ -1404,10 +1515,14 @@ def train(dim_word=100,  # word vector dimensionality
           dropout_src=0.0,
           dropout_trg=0.0,
           reload_=False,
-          overwrite=False):
+          overwrite=False,
+          **bleu_params
+          ):
 
     # Model options
     model_options = locals().copy()
+    # BLEU validation #
+    bleu_valid = BleuValidator(model_options, **bleu_params)
 
     # load dictionaries and invert them
     worddicts = [None] * len(dictionaries)
@@ -1516,13 +1631,19 @@ def train(dim_word=100,  # word vector dimensionality
 
     best_p = None
     bad_counter = 0
+    bad_counter_bleu = 0
     uidx = 0
     estop = False
     history_errs = []
+    history_bleu = []
+    valid_not_fin = []
     # reload history
     if reload_ and os.path.exists(saveto):
         rmodel = numpy.load(saveto)
-        history_errs = list(rmodel['history_errs'])
+        if 'history_errs' in rmodel:
+            history_errs = list(rmodel['history_errs'])
+        if 'history_bleu' in rmodel:
+            history_bleu = list(rmodel['history_bleu'])
         if 'uidx' in rmodel:
             uidx = rmodel['uidx']
 
@@ -1549,15 +1670,12 @@ def train(dim_word=100,  # word vector dimensionality
                 print 'Minibatch with zero sample under length ', maxlen
                 uidx -= 1
                 continue
-
             ud_start = time.time()
-
             # compute cost, grads and copy grads to shared variables
             cost = f_grad_shared(x, x_mask, y, y_mask)
 
             # do the update on parameters
             f_update(lrate)
-
             ud = time.time() - ud_start
 
             # check for bad numbers, usually we remove non-finite elements
@@ -1565,40 +1683,36 @@ def train(dim_word=100,  # word vector dimensionality
             if numpy.isnan(cost) or numpy.isinf(cost):
                 print 'NaN detected'
                 return 1., 1., 1.
-
             # verbose / update info display 
             if numpy.mod(uidx, dispFreq) == 0: # 
                 print 'Epoch ', eidx, 'Update ', uidx, 'Cost ', cost, 'UD ', ud
-
             # save the best model so far, in addition, save the latest model
             # into a separate file with the iteration number for external eval
+##############################################################################################
             if numpy.mod(uidx, saveFreq) == 0:
                 print 'Saving the best model...',
                 if best_p is not None:
                     params = best_p
                 else:
                     params = unzip(tparams)
-                numpy.savez(saveto, history_errs=history_errs, uidx=uidx, **params)
+                numpy.savez(saveto, 
+                            history_errs=history_errs,
+                            history_bleu=history_bleu,
+                            uidx=uidx, **params)
                 pkl.dump(model_options, open('%s.pkl' % saveto, 'wb'))
                 print 'Done'
                 
-                if numpy.mod(uidx, saveFreq *50) == 0: 
-                    print 'Saving (Check Point) at iteration {}...'.format(uidx),
-                    saveto_uidx = '{}.iter{}.npz'.format(
-                        os.path.splitext(saveto)[0], uidx)
-                    numpy.savez(saveto_uidx, history_errs=history_errs,
-                                uidx=uidx, **unzip(tparams))
-                    print 'Done'
-                    
-                # save with uidx
+                # save with every uidx
                 if not overwrite:
                     print 'Saving the model at iteration {}...'.format(uidx),
                     saveto_uidx = '{}.iter{}.npz'.format(
                         os.path.splitext(saveto)[0], uidx)
-                    numpy.savez(saveto_uidx, history_errs=history_errs,
+                    numpy.savez(saveto_uidx, 
+                                history_errs=history_errs,
+                                history_bleu=history_bleu,
                                 uidx=uidx, **unzip(tparams))
                     print 'Done'
-
+##############################################################################################
             # generate some samples with the model and display them
             if numpy.mod(uidx, sampleFreq) == 0:
                 # FIXME: random selection
@@ -1644,7 +1758,7 @@ def train(dim_word=100,  # word vector dimensionality
                         else:
                             print 'UNK',
                     print
-
+##############################################################################################
             # validate model on validation set and early stop if necessary
             if numpy.mod(uidx, validFreq) == 0:
                 use_noise.set_value(0.)
@@ -1653,22 +1767,68 @@ def train(dim_word=100,  # word vector dimensionality
                 valid_err = valid_errs.mean()
                 history_errs.append(valid_err)
 
-                if uidx == 0 or valid_err <= numpy.array(history_errs).min():
-                    best_p = unzip(tparams)
-                    bad_counter = 0
-                if len(history_errs) > patience and valid_err >= \
-                        numpy.array(history_errs)[:-patience].min():
-                    bad_counter += 1
-                    if bad_counter > patience:
-                        print 'Early Stop!'
-                        estop = True
-                        break
-
+            # bleu validation only happends when valid cost came below 100
+            # or the bleu is always 0 then early stops when training starts
+                if numpy.mod(uidx,validFreq*10)==0 and valid_err<70:
+                    # save a independent model for bleu validation:
+                    temp_p = unzip(tparams)
+                    print 'Saving (Check Point) at iteration {}...'.format(uidx),
+                    saveto_uidx = '{}.iter{}.npz'.format(
+                        os.path.splitext(saveto)[0], uidx)
+                    numpy.savez(saveto_uidx, 
+                                history_errs=history_errs,
+                                history_bleu=history_bleu,
+                                uidx=uidx, **unzip(tparams))
+                    print 'Done'
+                    # validate the saved model and get bleu , subprocess 
+                    # is stored and checked before a new validation
+                    if len(valid_not_fin) > 0:
+                        popen,previous_p,previous_model,previous_trans,previous_uidx,previous_eidx = \
+                            valid_not_fin.pop()
+                        popen.wait()
+                        valid_bleu = bleu_valid.testBLEU(previous_trans)
+                        history_bleu.append(valid_bleu)
+                        print 'Epoch %d Update %d BLEU %f\t Best BLEU %f' %\
+                            (eidx, uidx, valid_bleu, numpy.array(history_bleu).max())
+                        # remove the temporal model used in validation
+                        if numpy.mod(previous_uidx,validFreq*100)!=0:
+                            print 'remove temp file... '+previous_model,
+                            bleu_valid.remove_temp_file(model_file=previous_model,trans_file=previous_trans)                        
+                            print ' Done'
+                        if previous_uidx == 0 or valid_bleu>=numpy.array(history_bleu).max():
+                            best_p = previous_p
+                            bad_counter_bleu = 0
+                        if len(history_bleu) > patience_bleu and valid_bleu <=\
+                                numpy.array(history_bleu)[:-patience_bleu].max():
+                            bad_counter_bleu += 1
+                            if bad_counter_bleu > patience_bleu:
+                                print 'Early Stop'
+                                estop = True
+                                break
+                        
+                    trans_saveto="transMem.iter%d" % uidx
+                    popen = bleu_valid.decode(theano.config.device,
+                                              trans_saveto,
+                                              saveto_uidx,
+                                              )
+                    valid_not_fin.append((popen,temp_p,saveto_uidx,trans_saveto,copy.deepcopy(uidx),eidx))
+                else:
+                # using default validation with valid_errs
+                    if uidx == 0 or valid_err <= numpy.array(history_errs).min():
+                        best_p = unzip(tparams)
+                        bad_counter = 0
+                    if len(history_errs) > patience and valid_err >= \
+                            numpy.array(history_errs)[:-patience].min():
+                        bad_counter += 1
+                        if bad_counter > patience:
+                            print 'Early Stop!'
+                            estop = True
+                            break    
                 if numpy.isnan(valid_err):
                     ipdb.set_trace()
 
                 print 'Valid ', valid_err
-
+##############################################################################################
             # finish after this many updates
             if uidx >= finish_after:
                 print 'Finishing after %d iterations!' % uidx
@@ -1679,6 +1839,18 @@ def train(dim_word=100,  # word vector dimensionality
 
         if estop:
             break
+    
+    if len(valid_not_fin)>0:
+        popen,previous_p,previous_model,previous_trans,previous_uidx,previous_eidx = \
+                valid_not_fin.pop()
+        popen.wait()
+        valid_bleu = bleu_valid.testBLEU(previous_trans)
+        history_bleu.append(valid_bleu)
+        if valid_bleu > numpy.array(history_bleu).max():
+            best_p=previous_p
+            os.system('cp %s %s' % (previous_model,saveto))
+        print 'Final Update %d BLEU %f\t Best BLEU %f' \
+              % (uidx, this_bleu, numpy.array(history_bleu).max())
 
     if best_p is not None:
         zipp(best_p, tparams)
@@ -1692,11 +1864,11 @@ def train(dim_word=100,  # word vector dimensionality
     params = copy.copy(best_p)
     numpy.savez(saveto, zipped_params=best_p,
                 history_errs=history_errs,
+                history_bleu=history_bleu,
                 uidx=uidx,
                 **params)
 
     return valid_err
-
 
 if __name__ == '__main__':
     pass
