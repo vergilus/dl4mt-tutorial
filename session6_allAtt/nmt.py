@@ -21,6 +21,8 @@ from bleu_validator import BleuValidator
 
 sys.setrecursionlimit(10000)
 profile = False
+floatX = theano.config.floatX
+numpy_floatX = numpy.typeDict[floatX]
 
 def zipp(params, tparams):
     # push parameters to Theano shared variables
@@ -46,6 +48,16 @@ def dropout_layer(state_before, use_noise, trng, drop_rate=0.5):
                                      dtype=state_before.dtype),
         state_before * (1-drop_rate))
     return proj
+
+def normalize_layer(x,gamma,beta):
+    epsilon=numpy_floatX(1e-8)
+    if x.ndim==3:
+        result=(x-x.mean(2)[:,:,None]) / tensor.sqrt((x.var(2)[:,:,None]+epsilon))
+        result = gamma[None,None,:] * result +beta[None,None,:]
+    else:
+        result=(x-x.mean(1)[:,None]) / tensor.sqrt((x.var(1)[:,None]+epsilon))
+        result = gamma[None,:] * result + beta[None,:]
+    return result
 
 def _p(pp, name):# make prefix-appended name
     return '%s_%s' % (pp, name)
@@ -288,14 +300,11 @@ def ffNorm_layer(tparams, options, state_below, prefix='ff_norm',
     result += state_below
     # input is a 2 or more dimension tensor last dimension is the dim to normalize
     # epsilon is a small value that prevents zero devision 
-    # gamma-beta is the vector for the normalization scale and shift        
-    mean = tensor.mean(result,axis=-1,keepdims=True)
-    variation = tensor.var(result, axis=-1, keepdims=True)
+    # gamma-beta is the vector for the normalization scale and shift
+    result=normalize_layer(result, 
+                           tparams[_p(prefix, 'gamma')], 
+                           tparams[_p(prefix, 'beta')])
     
-    result = (result-mean)/((variation+epsilon)**0.5)
-    # return the value through a scale and shift
-    result = result*tparams[_p(prefix, 'gamma')][None,None,:]+\
-            tparams[_p(prefix, 'beta')][None,None,:]
     return result
 
 # Conditional GRU layer with Attention
@@ -407,12 +416,16 @@ def multiAtt_layer(tparams, options, trng, use_noise,
 
     # residual connection and normalize
     attention_result+=queries
-    # and layer normalize
-    mean = tensor.mean(attention_result,axis=-1,keepdims=True)
-    variation=tensor.var(attention_result,axis=-1,keepdims=True)
-    result = (attention_result-mean)/((variation+epsilon)**0.5)
-    result = result*tparams[_p(prefix,'gamma')][None,None,:]+\
-            tparams[_p(prefix,'beta')][None,None,:]
+    # and layer normalize    
+    result = normalize_layer(attention_result,
+                             tparams[_p(prefix,'gamma')], 
+                             tparams[_p(prefix,'beta')]
+                             )
+#     mean = tensor.mean(attention_result,axis=-1,keepdims=True)
+#     variation=tensor.var(attention_result,axis=-1,keepdims=True)
+#     result = (attention_result-mean)/((variation+epsilon)**0.5)
+#     result = result*tparams[_p(prefix,'gamma')][None,None,:]+\
+#             tparams[_p(prefix,'beta')][None,None,:]
     # result shape: timestep*nsamples(beam)*dim
     return result 
 
@@ -924,7 +937,7 @@ def sgd(lr, tparams, grads, x, mask, y, cost):
 def train(dim=1000,  # model dimension
           encoder='fullAtt',
           decoder='fullAtt',
-          layer_num=3,
+          layer_num=6,
           head_num=8,
           patience=10,  # early stopping patience
           max_epochs=5000,
