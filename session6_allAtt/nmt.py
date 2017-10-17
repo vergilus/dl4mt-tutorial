@@ -412,22 +412,22 @@ def multiAtt_layer(tparams, options, trng, use_noise,
     # attention result is nsample, timestep_q, dim
     attention_result= concatenate(split(result, [nsamples]*head_num, head_num, axis=0), 
                                          axis=-1)
-    attention_result=attention_result.dimshuffle([1,0,2])
 
     # residual connection and normalize
-    attention_result+=queries
+    attention_result+=queries.dimshuffle([1,0,2])
     # and layer normalize    
     result = normalize_layer(attention_result,
                              tparams[_p(prefix,'gamma')], 
                              tparams[_p(prefix,'beta')]
                              )
+    result = result.dimshuffle([1,0,2])
 #     mean = tensor.mean(attention_result,axis=-1,keepdims=True)
 #     variation=tensor.var(attention_result,axis=-1,keepdims=True)
 #     result = (attention_result-mean)/((variation+epsilon)**0.5)
 #     result = result*tparams[_p(prefix,'gamma')][None,None,:]+\
 #             tparams[_p(prefix,'beta')][None,None,:]
     # result shape: timestep*nsamples(beam)*dim
-    return result 
+    return result
 
 def init_params(options):
     params = OrderedDict()
@@ -937,7 +937,7 @@ def sgd(lr, tparams, grads, x, mask, y, cost):
 def train(dim=1000,  # model dimension
           encoder='fullAtt',
           decoder='fullAtt',
-          layer_num=6,
+          layer_num=2,
           head_num=8,
           patience=10,  # early stopping patience
           max_epochs=5000,
